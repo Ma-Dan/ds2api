@@ -24,6 +24,9 @@ func ValidateConfig(c Config) error {
 	if err := ValidateAutoDeleteConfig(c.AutoDelete); err != nil {
 		return err
 	}
+	if err := ValidateCurrentInputFileConfig(c.CurrentInputFile); err != nil {
+		return err
+	}
 	if err := ValidateAccountProxyReferences(c.Accounts, c.Proxies); err != nil {
 		return err
 	}
@@ -109,6 +112,13 @@ func ValidateEmbeddingsConfig(embeddings EmbeddingsConfig) error {
 
 func ValidateAutoDeleteConfig(autoDelete AutoDeleteConfig) error {
 	return ValidateAutoDeleteMode(autoDelete.Mode)
+}
+
+func ValidateCurrentInputFileConfig(currentInputFile CurrentInputFileConfig) error {
+	if currentInputFile.MinChars != 0 {
+		return ValidateIntRange("current_input_file.min_chars", currentInputFile.MinChars, 1, 100000000, true)
+	}
+	return nil
 }
 
 func ValidateIntRange(name string, value, min, max int, required bool) error {

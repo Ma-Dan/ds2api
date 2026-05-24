@@ -1,17 +1,15 @@
 'use strict';
 
-// Keep in sync with Go toolSieveContextTailLimit.
-const TOOL_SIEVE_CONTEXT_TAIL_LIMIT = 2048;
-
 function createToolSieveState() {
   return {
     pending: '',
     capture: '',
     capturing: false,
-    recentTextTail: '',
     codeFenceStack: [],
     codeFencePendingTicks: 0,
+    codeFencePendingTildes: 0,
     codeFenceLineStart: true,
+    markdownCodeSpanTicks: 0,
     pendingToolRaw: '',
     pendingToolCalls: [],
     disableDeltas: false,
@@ -38,21 +36,8 @@ function noteText(state, text) {
   if (!state || !hasMeaningfulText(text)) {
     return;
   }
+  updateMarkdownCodeSpanState(state, text);
   updateCodeFenceState(state, text);
-  state.recentTextTail = appendTail(state.recentTextTail, text, TOOL_SIEVE_CONTEXT_TAIL_LIMIT);
-}
-
-function appendTail(prev, next, max) {
-  const left = typeof prev === 'string' ? prev : '';
-  const right = typeof next === 'string' ? next : '';
-  if (!Number.isFinite(max) || max <= 0) {
-    return '';
-  }
-  const combined = left + right;
-  if (combined.length <= max) {
-    return combined;
-  }
-  return combined.slice(combined.length - max);
 }
 
 function looksLikeToolExampleContext(text) {
@@ -64,8 +49,7 @@ function insideCodeFence(text) {
   if (!t) {
     return false;
   }
-  const ticks = (t.match(/```/g) || []).length;
-  return ticks % 2 === 1;
+  return simulateCodeFenceState([], 0, 0, true, t).stack.length > 0;
 }
 
 function insideCodeFenceWithState(state, text) {
@@ -75,10 +59,73 @@ function insideCodeFenceWithState(state, text) {
   const simulated = simulateCodeFenceState(
     Array.isArray(state.codeFenceStack) ? state.codeFenceStack : [],
     Number.isInteger(state.codeFencePendingTicks) ? state.codeFencePendingTicks : 0,
+    Number.isInteger(state.codeFencePendingTildes) ? state.codeFencePendingTildes : 0,
     state.codeFenceLineStart !== false,
     text,
   );
   return simulated.stack.length > 0;
+}
+
+function insideMarkdownCodeSpanWithState(state, text) {
+  if (!state) {
+    return simulateMarkdownCodeSpanTicks(null, 0, text) > 0;
+  }
+  const ticks = Number.isInteger(state.markdownCodeSpanTicks) ? state.markdownCodeSpanTicks : 0;
+  return simulateMarkdownCodeSpanTicks(state, ticks, text) > 0;
+}
+
+function updateMarkdownCodeSpanState(state, text) {
+  if (!state || !hasMeaningfulText(text)) {
+    return;
+  }
+  const ticks = Number.isInteger(state.markdownCodeSpanTicks) ? state.markdownCodeSpanTicks : 0;
+  state.markdownCodeSpanTicks = simulateMarkdownCodeSpanTicks(state, ticks, text);
+}
+
+function simulateMarkdownCodeSpanTicks(state, initialTicks, text) {
+  const raw = typeof text === 'string' ? text : '';
+  let ticks = Number.isInteger(initialTicks) ? initialTicks : 0;
+  for (let i = 0; i < raw.length;) {
+    if (raw[i] !== '`') {
+      i += 1;
+      continue;
+    }
+    const run = countBacktickRun(raw, i);
+    if (ticks === 0) {
+      if (run >= 3 && atMarkdownFenceLineStart(raw, i)) {
+        i += run;
+        continue;
+      }
+      if (state && insideCodeFenceWithState(state, raw.slice(0, i))) {
+        i += run;
+        continue;
+      }
+      ticks = run;
+    } else if (run === ticks) {
+      ticks = 0;
+    }
+    i += run;
+  }
+  return ticks;
+}
+
+function countBacktickRun(text, start) {
+  let count = 0;
+  while (start + count < text.length && text[start + count] === '`') {
+    count += 1;
+  }
+  return count;
+}
+
+function atMarkdownFenceLineStart(text, idx) {
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') {
+      continue;
+    }
+    return ch === '\n' || ch === '\r';
+  }
+  return true;
 }
 
 function updateCodeFenceState(state, text) {
@@ -88,37 +135,57 @@ function updateCodeFenceState(state, text) {
   const next = simulateCodeFenceState(
     Array.isArray(state.codeFenceStack) ? state.codeFenceStack : [],
     Number.isInteger(state.codeFencePendingTicks) ? state.codeFencePendingTicks : 0,
+    Number.isInteger(state.codeFencePendingTildes) ? state.codeFencePendingTildes : 0,
     state.codeFenceLineStart !== false,
     text,
   );
   state.codeFenceStack = next.stack;
   state.codeFencePendingTicks = next.pendingTicks;
+  state.codeFencePendingTildes = next.pendingTildes;
   state.codeFenceLineStart = next.lineStart;
 }
 
-function simulateCodeFenceState(stack, pendingTicks, lineStart, text) {
+function simulateCodeFenceState(stack, pendingTicks, pendingTildes, lineStart, text) {
   const chunk = typeof text === 'string' ? text : '';
   const nextStack = Array.isArray(stack) ? [...stack] : [];
   let ticks = Number.isInteger(pendingTicks) ? pendingTicks : 0;
+  let tildes = Number.isInteger(pendingTildes) ? pendingTildes : 0;
   let atLineStart = lineStart !== false;
 
-  const flushTicks = () => {
+  const flushPending = () => {
     if (ticks > 0) {
       if (atLineStart && ticks >= 3) {
-        applyFenceMarker(nextStack, ticks);
+        applyFenceMarker(nextStack, ticks); // positive = backtick
       }
       atLineStart = false;
       ticks = 0;
+    }
+    if (tildes > 0) {
+      if (atLineStart && tildes >= 3) {
+        applyFenceMarker(nextStack, -tildes); // negative = tilde
+      }
+      atLineStart = false;
+      tildes = 0;
     }
   };
 
   for (let i = 0; i < chunk.length; i += 1) {
     const ch = chunk[i];
     if (ch === '`') {
+      if (tildes > 0) {
+        flushPending();
+      }
       ticks += 1;
       continue;
     }
-    flushTicks();
+    if (ch === '~') {
+      if (ticks > 0) {
+        flushPending();
+      }
+      tildes += 1;
+      continue;
+    }
+    flushPending();
     if (ch === '\n' || ch === '\r') {
       atLineStart = true;
       continue;
@@ -128,29 +195,37 @@ function simulateCodeFenceState(stack, pendingTicks, lineStart, text) {
     }
     atLineStart = false;
   }
-  // keep ticks for cross-chunk continuation.
   return {
     stack: nextStack,
     pendingTicks: ticks,
+    pendingTildes: tildes,
     lineStart: atLineStart,
   };
 }
 
-function applyFenceMarker(stack, ticks) {
+// Positive values = backtick fences, negative = tilde fences.
+// Closing must match fence type.
+function applyFenceMarker(stack, marker) {
   if (!Array.isArray(stack)) {
     return;
   }
   if (stack.length === 0) {
-    stack.push(ticks);
+    stack.push(marker);
     return;
   }
   const top = stack[stack.length - 1];
-  if (ticks >= top) {
+  const sameType = (top > 0 && marker > 0) || (top < 0 && marker < 0);
+  if (!sameType) {
+    stack.push(marker);
+    return;
+  }
+  const absMarker = Math.abs(marker);
+  const absTop = Math.abs(top);
+  if (absMarker >= absTop) {
     stack.pop();
     return;
   }
-  // nested/open inner fence using longer marker for robustness.
-  stack.push(ticks);
+  stack.push(marker);
 }
 
 function hasMeaningfulText(text) {
@@ -171,15 +246,15 @@ function toStringSafe(v) {
 }
 
 module.exports = {
-  TOOL_SIEVE_CONTEXT_TAIL_LIMIT,
   createToolSieveState,
   resetIncrementalToolState,
   noteText,
-  appendTail,
   looksLikeToolExampleContext,
   insideCodeFence,
   insideCodeFenceWithState,
+  insideMarkdownCodeSpanWithState,
   updateCodeFenceState,
+  updateMarkdownCodeSpanState,
   hasMeaningfulText,
   toStringSafe,
 };

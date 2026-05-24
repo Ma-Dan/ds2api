@@ -10,6 +10,8 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 
+import { maskSecret } from '../../utils/maskSecret'
+
 export default function ConfigPanel({
     t,
     configExpanded,
@@ -17,6 +19,7 @@ export default function ConfigPanel({
     models,
     model,
     setModel,
+    modelsLoaded,
     streamingMode,
     setStreamingMode,
     selectedAccount,
@@ -38,13 +41,17 @@ export default function ConfigPanel({
         ToggleLeft,
         ToggleRight,
     }
+    const selectedModel = models.find(m => m.id === model) || models[0]
+    const SelectedModelIcon = selectedModel ? (iconMap[selectedModel.icon] || MessageSquare) : MessageSquare
+    const defaultKeyPreview = maskSecret(config.keys?.[0])
+    const hasModels = models.length > 0
 
     return (
         <div className={clsx(
-            "lg:col-span-3 flex flex-col transition-all duration-300 ease-in-out z-20",
+            "lg:col-span-3 flex flex-col transition-all duration-300 ease-in-out z-20 min-h-0",
             configExpanded ? "h-auto" : "h-14 lg:h-full"
         )}>
-            <div className="bg-card border border-border rounded-xl flex flex-col h-full shadow-sm">
+            <div className="bg-card border border-border rounded-xl flex flex-col h-full shadow-sm min-h-0 overflow-hidden">
                 <button
                     onClick={() => setConfigExpanded(!configExpanded)}
                     className="lg:hidden flex items-center justify-between p-4 w-full bg-muted/20 hover:bg-muted/30 transition-colors"
@@ -61,49 +68,60 @@ export default function ConfigPanel({
                 </button>
 
                 <div className={clsx(
-                    "p-4 space-y-6 overflow-y-auto custom-scrollbar flex-1",
-                    !configExpanded && "hidden lg:block"
+                    "p-4 flex flex-col gap-5",
+                    !configExpanded && "hidden lg:flex"
                 )}>
-                    <div className="space-y-3">
+                    <div className="space-y-2 shrink-0">
                         <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider ml-0.5">{t('apiTester.modelLabel')}</label>
-                        <div className="grid grid-cols-1 gap-2">
-                            {models.map(m => {
-                                const Icon = iconMap[m.icon] || MessageSquare
-                                return (
-                                    <button
-                                        key={m.id}
-                                        onClick={() => setModel(m.id)}
-                                        className={clsx(
-                                            "group relative flex items-start gap-3 p-3 rounded-lg border text-left transition-all duration-200",
-                                            model === m.id
-                                                ? "bg-secondary border-primary/50 shadow-sm"
-                                                : "bg-transparent border-transparent hover:bg-muted"
-                                        )}
-                                    >
-                                        <div className={clsx(
-                                            "p-1.5 rounded-md shrink-0 transition-colors",
-                                            model === m.id ? m.color : "text-muted-foreground group-hover:text-foreground"
-                                        )}>
-                                            <Icon className="w-4 h-4" />
-                                        </div>
-                                        <div className="min-w-0 flex-1">
-                                            <div className={clsx("font-medium text-sm", model === m.id ? "text-foreground" : "text-foreground/80") }>
-                                                {m.name}
-                                            </div>
-                                            <div className="text-[11px] text-muted-foreground mt-0.5">{m.desc}</div>
-                                        </div>
-                                        {model === m.id && (
-                                            <div className={clsx("absolute top-3 right-3", m.color)}>
-                                                <div className="w-1.5 h-1.5 rounded-full bg-current" />
-                                            </div>
-                                        )}
-                                    </button>
-                                )
-                            })}
+                        <div className="relative">
+                            <select
+                                className="w-full h-11 pl-3 pr-9 bg-secondary border border-border rounded-lg text-sm appearance-none focus:outline-none focus:ring-1 focus:ring-ring focus:border-ring transition-all cursor-pointer hover:bg-muted/70 text-foreground disabled:opacity-60 disabled:cursor-not-allowed"
+                                value={model}
+                                onChange={e => setModel(e.target.value)}
+                                disabled={!hasModels}
+                            >
+                                {hasModels ? models.map(m => (
+                                    <option key={m.id} value={m.id} className="bg-popover text-popover-foreground">
+                                        {m.name}
+                                    </option>
+                                )) : (
+                                    <option value="" className="bg-popover text-popover-foreground">
+                                        {modelsLoaded ? t('apiTester.noModels') : t('apiTester.loadingModels')}
+                                    </option>
+                                )}
+                            </select>
+                            <ChevronDown className="absolute right-2.5 top-3.5 w-4 h-4 text-muted-foreground pointer-events-none" />
                         </div>
+                        {selectedModel ? (
+                            <div className="mt-3 rounded-lg border border-border bg-muted/20 p-3">
+                                <div className="flex items-start gap-3">
+                                    <div className={clsx(
+                                        "p-2 rounded-md shrink-0 border border-border bg-background/80",
+                                        selectedModel.color
+                                    )}>
+                                        <SelectedModelIcon className="w-4 h-4" />
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                        <div className="font-medium text-sm text-foreground truncate">
+                                            {selectedModel.name}
+                                        </div>
+                                        <div className="text-[11px] text-muted-foreground mt-1 leading-relaxed">
+                                            {selectedModel.desc}
+                                        </div>
+                                    </div>
+                                </div>
+                                <p className="text-[11px] text-muted-foreground/70 mt-2">
+                                    {t('apiTester.modelPickerHint')}
+                                </p>
+                            </div>
+                        ) : (
+                            <div className="mt-3 rounded-lg border border-dashed border-border bg-muted/10 p-3 text-[11px] text-muted-foreground leading-relaxed">
+                                {modelsLoaded ? t('apiTester.noModelsHint') : t('apiTester.loadingModelsHint')}
+                            </div>
+                        )}
                     </div>
 
-                    <div className="space-y-2">
+                    <div className="space-y-2 shrink-0">
                         <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider ml-0.5">{t('apiTester.streamMode')}</label>
                         <button
                             onClick={() => setStreamingMode(!streamingMode)}
@@ -124,7 +142,7 @@ export default function ConfigPanel({
                         </button>
                     </div>
 
-                    <div className="space-y-2">
+                    <div className="space-y-2 shrink-0">
                         <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider ml-0.5">{t('apiTester.accountSelector')}</label>
                         <div className="relative">
                             <select
@@ -147,14 +165,14 @@ export default function ConfigPanel({
                         </div>
                     </div>
 
-                    <div className="space-y-2">
+                    <div className="space-y-2 shrink-0">
                         <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider ml-0.5">{t('apiTester.apiKeyOptional')}</label>
                         <input
                             type="text"
                             autoComplete="off"
                             spellCheck={false}
                             className="w-full h-10 px-3 bg-muted/30 border border-border rounded-lg text-sm font-mono placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-ring focus:border-ring transition-all"
-                            placeholder={config.keys?.[0] ? t('apiTester.apiKeyDefault', { suffix: config.keys[0].slice(-6) }) : t('apiTester.apiKeyPlaceholder')}
+                            placeholder={defaultKeyPreview ? t('apiTester.apiKeyDefault', { preview: defaultKeyPreview }) : t('apiTester.apiKeyPlaceholder')}
                             value={apiKey}
                             onChange={e => setApiKey(e.target.value)}
                         />

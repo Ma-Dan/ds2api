@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 export function useApiTesterState({ t }) {
-    const [model, setModel] = useState('deepseek-chat')
+    const [model, setModel] = useState('deepseek-v4-flash')
     const defaultMessage = t('apiTester.defaultMessage')
     const [message, setMessage] = useState(defaultMessage)
     const [apiKey, setApiKey] = useState('')
@@ -12,6 +12,7 @@ export function useApiTesterState({ t }) {
     const [streamingThinking, setStreamingThinking] = useState('')
     const [isStreaming, setIsStreaming] = useState(false)
     const [streamingMode, setStreamingMode] = useState(true)
+    const [attachedFiles, setAttachedFiles] = useState([])
     const [configExpanded, setConfigExpanded] = useState(false)
 
     const abortControllerRef = useRef(null)
@@ -27,6 +28,8 @@ export function useApiTesterState({ t }) {
         setModel,
         message,
         setMessage,
+        attachedFiles,
+        setAttachedFiles,
         apiKey,
         setApiKey,
         selectedAccount,

@@ -1,7 +1,6 @@
 package toolcall
 
 import (
-	"encoding/json"
 	"strings"
 )
 
@@ -22,126 +21,60 @@ func ParseToolCalls(text string, availableToolNames []string) []ParsedToolCall {
 }
 
 func ParseToolCallsDetailed(text string, availableToolNames []string) ToolCallParseResult {
-	result := ToolCallParseResult{}
-	if strings.TrimSpace(text) == "" {
-		return result
-	}
-	result.SawToolCallSyntax = looksLikeToolCallSyntax(text)
-	if shouldSkipToolCallParsingForCodeFenceExample(text) {
-		return result
-	}
-
-	candidates := buildToolCallCandidates(text)
-	for _, candidate := range candidates {
-		if !isLikelyJSONToolPayloadCandidate(candidate) {
-			continue
-		}
-		tc := parseToolCallsPayload(candidate)
-		if len(tc) == 0 {
-			continue
-		}
-		parsed := tc
-		calls, rejectedNames := filterToolCallsDetailed(parsed)
-		result.Calls = calls
-		result.RejectedToolNames = rejectedNames
-		result.RejectedByPolicy = len(rejectedNames) > 0 && len(calls) == 0
-		result.SawToolCallSyntax = true
-		return result
-	}
-	var parsed []ParsedToolCall
-	for _, candidate := range candidates {
-		tc := parseXMLToolCalls(candidate)
-		if len(tc) == 0 {
-			tc = parseMarkupToolCalls(candidate)
-		}
-		if len(tc) == 0 {
-			tc = parseToolCallsPayload(candidate)
-		}
-		if len(tc) == 0 {
-			tc = parseTextKVToolCalls(candidate)
-		}
-		if len(tc) > 0 {
-			parsed = tc
-			result.SawToolCallSyntax = true
-			break
-		}
-	}
-	if len(parsed) == 0 {
-		parsed = parseXMLToolCalls(text)
-		if len(parsed) == 0 {
-			parsed = parseTextKVToolCalls(text)
-			if len(parsed) == 0 {
-				return result
-			}
-		}
-		result.SawToolCallSyntax = true
-	}
-
-	calls, rejectedNames := filterToolCallsDetailed(parsed)
-	result.Calls = calls
-	result.RejectedToolNames = rejectedNames
-	result.RejectedByPolicy = len(rejectedNames) > 0 && len(calls) == 0
-	return result
+	return parseToolCallsDetailedXMLOnly(text)
 }
+
 func ParseStandaloneToolCalls(text string, availableToolNames []string) []ParsedToolCall {
 	return ParseStandaloneToolCallsDetailed(text, availableToolNames).Calls
 }
 
 func ParseStandaloneToolCallsDetailed(text string, availableToolNames []string) ToolCallParseResult {
+	return parseToolCallsDetailedXMLOnly(text)
+}
+
+func ParseAssistantToolCallsDetailed(text, thinking string, availableToolNames []string) ToolCallParseResult {
+	textParsed := ParseStandaloneToolCallsDetailed(text, availableToolNames)
+	if len(textParsed.Calls) > 0 {
+		return textParsed
+	}
+	if strings.TrimSpace(text) != "" {
+		return textParsed
+	}
+	thinkingParsed := ParseStandaloneToolCallsDetailed(thinking, availableToolNames)
+	if len(thinkingParsed.Calls) > 0 {
+		return thinkingParsed
+	}
+	return textParsed
+}
+
+func parseToolCallsDetailedXMLOnly(text string) ToolCallParseResult {
 	result := ToolCallParseResult{}
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return result
 	}
-	result.SawToolCallSyntax = looksLikeToolCallSyntax(trimmed)
-	if shouldSkipToolCallParsingForCodeFenceExample(trimmed) {
+	trimmed = stripFencedCodeBlocks(trimmed)
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" {
 		return result
 	}
-	candidates := buildToolCallCandidates(trimmed)
-	var parsed []ParsedToolCall
-	for _, candidate := range candidates {
-		if !isLikelyJSONToolPayloadCandidate(candidate) {
-			continue
-		}
-		parsed = parseToolCallsPayload(candidate)
-		if len(parsed) == 0 {
-			continue
-		}
-		result.SawToolCallSyntax = true
-		calls, rejectedNames := filterToolCallsDetailed(parsed)
-		result.Calls = calls
-		result.RejectedToolNames = rejectedNames
-		result.RejectedByPolicy = len(rejectedNames) > 0 && len(calls) == 0
+
+	normalized, ok := normalizeDSMLToolCallMarkup(trimmed)
+	if !ok {
 		return result
 	}
-	for _, candidate := range candidates {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			continue
-		}
-		parsed = parseXMLToolCalls(candidate)
-		if len(parsed) == 0 {
-			parsed = parseMarkupToolCalls(candidate)
-		}
-		if len(parsed) == 0 {
-			parsed = parseToolCallsPayload(candidate)
-		}
-		if len(parsed) == 0 {
-			parsed = parseTextKVToolCalls(candidate)
-		}
-		if len(parsed) > 0 {
-			break
+	result.SawToolCallSyntax = looksLikeToolCallSyntax(normalized) || hasRepairableXMLToolCallsWrapper(normalized)
+	parsed := parseXMLToolCalls(normalized)
+	if len(parsed) == 0 && indexToolCDATAOpen(normalized, 0) >= 0 {
+		recovered := SanitizeLooseCDATA(normalized)
+		if recovered != normalized {
+			parsed = parseXMLToolCalls(recovered)
 		}
 	}
 	if len(parsed) == 0 {
-		parsed = parseXMLToolCalls(trimmed)
-		if len(parsed) == 0 {
-			parsed = parseTextKVToolCalls(trimmed)
-			if len(parsed) == 0 {
-				return result
-			}
-		}
+		return result
 	}
+
 	result.SawToolCallSyntax = true
 	calls, rejectedNames := filterToolCallsDetailed(parsed)
 	result.Calls = calls
@@ -164,70 +97,220 @@ func filterToolCallsDetailed(parsed []ParsedToolCall) ([]ParsedToolCall, []strin
 	return out, nil
 }
 
-//nolint:unused // retained for policy-level tool-name matching compatibility.
-func resolveAllowedToolName(name string, allowed map[string]struct{}, allowedCanonical map[string]string) string {
-	return resolveAllowedToolNameWithLooseMatch(name, allowed, allowedCanonical)
-}
-
-func parseToolCallsPayload(payload string) []ParsedToolCall {
-	var decoded any
-	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-		// Try to repair backslashes first! Because LLMs often mix these two problems.
-		repaired := repairInvalidJSONBackslashes(payload)
-		// Try loose repair on top of that
-		repaired = RepairLooseJSON(repaired)
-		if err := json.Unmarshal([]byte(repaired), &decoded); err != nil {
-			return nil
-		}
-	}
-	switch v := decoded.(type) {
-	case map[string]any:
-		if tc, ok := v["tool_calls"]; ok {
-			if isLikelyChatMessageEnvelope(v) {
-				return nil
-			}
-			return parseToolCallList(tc)
-		}
-		if parsed, ok := parseToolCallItem(v); ok {
-			return []ParsedToolCall{parsed}
-		}
-	case []any:
-		return parseToolCallList(v)
-	}
-	return nil
-}
-
-func isLikelyChatMessageEnvelope(v map[string]any) bool {
-	if v == nil {
-		return false
-	}
-	if _, ok := v["tool_calls"]; !ok {
-		return false
-	}
-	if role, ok := v["role"].(string); ok {
-		switch strings.ToLower(strings.TrimSpace(role)) {
-		case "assistant", "tool", "user", "system":
-			return true
-		}
-	}
-	if _, ok := v["tool_call_id"]; ok {
-		return true
-	}
-	if _, ok := v["content"]; ok {
-		return true
-	}
-	return false
-}
-
 func looksLikeToolCallSyntax(text string) bool {
-	lower := strings.ToLower(text)
-	return strings.Contains(lower, "tool_calls") ||
-		strings.Contains(lower, "\"function\"") ||
-		strings.Contains(lower, "functioncall") ||
-		strings.Contains(lower, "\"tool_use\"") ||
-		strings.Contains(lower, "<tool_call") ||
-		strings.Contains(lower, "<function_call") ||
-		strings.Contains(lower, "<function_name") ||
-		strings.Contains(lower, "<invoke") ||
-		strings.Contains(lower, "function.name:")
+	hasDSML, hasCanonical := ContainsToolCallWrapperSyntaxOutsideIgnored(text)
+	return hasDSML || hasCanonical
+}
+
+func stripFencedCodeBlocks(text string) string {
+	if text == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+
+	lines := strings.SplitAfter(text, "\n")
+	inFence := false
+	fenceMarker := ""
+	inCDATA := false
+	cdataFenceMarker := ""
+	// Track builder length when a fence opens so we can preserve content
+	// collected before the unclosed fence.
+	beforeFenceLen := 0
+	for _, line := range lines {
+		if inCDATA || cdataStartsBeforeFence(line) {
+			b.WriteString(line)
+			inCDATA, cdataFenceMarker = updateCDATAStateForStrip(inCDATA, cdataFenceMarker, line)
+			continue
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if !inFence {
+			if marker, ok := parseFenceOpen(trimmed); ok {
+				inFence = true
+				fenceMarker = marker
+				beforeFenceLen = b.Len()
+				continue
+			}
+			b.WriteString(line)
+			continue
+		}
+
+		if isFenceClose(trimmed, fenceMarker) {
+			inFence = false
+			fenceMarker = ""
+		}
+	}
+
+	if inFence {
+		// Unclosed fence: preserve content that was collected before the
+		// fence started rather than dropping everything.
+		result := b.String()
+		if beforeFenceLen > 0 && beforeFenceLen <= len(result) {
+			return result[:beforeFenceLen]
+		}
+		return ""
+	}
+	return b.String()
+}
+
+func markdownCodeSpanEnd(text string, start int) (int, bool) {
+	if start < 0 || start >= len(text) || text[start] != '`' {
+		return start, false
+	}
+	count := countLeadingFenceChars(text[start:], '`')
+	if count == 0 {
+		return start, false
+	}
+	search := start + count
+	for search < len(text) {
+		if text[search] != '`' {
+			search++
+			continue
+		}
+		run := countLeadingFenceChars(text[search:], '`')
+		if run == count {
+			return search + run, true
+		}
+		search += run
+	}
+	return start, false
+}
+
+func cdataStartsBeforeFence(line string) bool {
+	cdataIdx := indexToolCDATAOpen(line, 0)
+	if cdataIdx < 0 {
+		return false
+	}
+	fenceIdx := firstFenceMarkerIndex(line)
+	return fenceIdx < 0 || cdataIdx < fenceIdx
+}
+
+func firstFenceMarkerIndex(line string) int {
+	idxBacktick := strings.Index(line, "```")
+	idxTilde := strings.Index(line, "~~~")
+	switch {
+	case idxBacktick < 0:
+		return idxTilde
+	case idxTilde < 0:
+		return idxBacktick
+	case idxBacktick < idxTilde:
+		return idxBacktick
+	default:
+		return idxTilde
+	}
+}
+
+func updateCDATAStateForStrip(inCDATA bool, cdataFenceMarker, line string) (bool, string) {
+	pos := 0
+	state := inCDATA
+	fenceMarker := cdataFenceMarker
+	lineForFence := line
+	if !state {
+		start := indexToolCDATAOpen(line, pos)
+		if start < 0 {
+			return false, ""
+		}
+		pos = start + toolCDATAOpenLenAt(line, start)
+		if pos > len(line) {
+			pos = len(line)
+		}
+		state = true
+		lineForFence = line[pos:]
+	}
+	if !state {
+		return false, ""
+	}
+
+	trimmed := strings.TrimLeft(lineForFence, " \t")
+	if fenceMarker == "" {
+		if marker, ok := parseFenceOpen(trimmed); ok {
+			fenceMarker = marker
+		}
+	} else if isFenceClose(trimmed, fenceMarker) {
+		fenceMarker = ""
+	}
+
+	for pos < len(line) {
+		endPos := -1
+		closeLen := 0
+		for search := pos; search < len(line); search++ {
+			if foundLen := toolCDATACloseLenAt(line, search); foundLen > 0 {
+				endPos = search
+				closeLen = foundLen
+				break
+			}
+		}
+		if endPos < 0 {
+			return true, fenceMarker
+		}
+		pos = endPos + closeLen
+		if pos > len(line) {
+			pos = len(line)
+		}
+		if fenceMarker != "" {
+			continue
+		}
+		if cdataEndLooksStructural(line, pos) || strings.TrimSpace(line[pos:]) == "" {
+			state = false
+			for pos < len(line) {
+				start := indexToolCDATAOpen(line, pos)
+				if start < 0 {
+					return false, ""
+				}
+				pos = start + toolCDATAOpenLenAt(line, start)
+				if pos > len(line) {
+					pos = len(line)
+				}
+				state = true
+				trimmedTail := strings.TrimLeft(line[pos:], " \t")
+				if marker, ok := parseFenceOpen(trimmedTail); ok {
+					fenceMarker = marker
+				} else {
+					fenceMarker = ""
+				}
+				break
+			}
+			continue
+		}
+	}
+	return state, fenceMarker
+}
+
+func parseFenceOpen(line string) (string, bool) {
+	if len(line) < 3 {
+		return "", false
+	}
+	ch := line[0]
+	if ch != '`' && ch != '~' {
+		return "", false
+	}
+	count := countLeadingFenceChars(line, ch)
+	if count < 3 {
+		return "", false
+	}
+	return strings.Repeat(string(ch), count), true
+}
+
+func isFenceClose(line, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	ch := marker[0]
+	if line == "" || line[0] != ch {
+		return false
+	}
+	count := countLeadingFenceChars(line, ch)
+	if count < len(marker) {
+		return false
+	}
+	rest := strings.TrimSpace(line[count:])
+	return rest == ""
+}
+
+func countLeadingFenceChars(line string, ch byte) int {
+	count := 0
+	for count < len(line) && line[count] == ch {
+		count++
+	}
+	return count
 }

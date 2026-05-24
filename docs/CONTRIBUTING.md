@@ -9,8 +9,8 @@
 ### 前置要求
 
 - Go 1.26+
-- Node.js `20.19+` 或 `22.12+`（WebUI 开发时）
-- npm（随 Node.js 提供）
+- Node.js `20.19+` 或 `22.12+`（WebUI 开发时；CI / Docker 构建使用 Node 24）
+- npm（随 Node.js 提供，建议 10+）
 
 ### 后端开发
 
@@ -36,7 +36,7 @@ go run ./cmd/ds2api
 cd webui
 
 # 2. 安装依赖
-npm install
+npm ci
 
 # 3. 启动开发服务器（热更新）
 npm run dev
@@ -59,9 +59,11 @@ docker-compose -f docker-compose.dev.yml up
 
 | 语言 | 规范 |
 | --- | --- |
-| **Go** | 提交前运行 `./scripts/lint.sh`（包含 gofmt+golangci-lint）并确保 `go test ./...` 通过 |
+| **Go** | 修改 Go 文件后运行 `gofmt -w`；提交前运行 `./scripts/lint.sh`（包含格式化检查和 golangci-lint） |
 | **JavaScript/React** | 保持现有代码风格（函数组件） |
 | **提交信息** | 使用语义化前缀：`feat:`、`fix:`、`docs:`、`refactor:`、`style:`、`perf:`、`chore:` |
+
+I/O 类清理调用（如 `Close`、`Flush`、`Sync`）的错误不要直接忽略；无法向上返回时请显式记录日志。
 
 ## 提交 PR
 
@@ -85,10 +87,13 @@ docker-compose -f docker-compose.dev.yml up
 ## 运行测试
 
 ```bash
-# Go + Node 单元测试（推荐）
+# PR 本地门禁（与 quality-gates 工作流保持一致）
+./scripts/lint.sh
+./tests/scripts/check-refactor-line-gate.sh
 ./tests/scripts/run-unit-all.sh
+npm run build --prefix webui
 
-# 端到端全链路测试（真实账号）
+# 端到端全链路测试（真实账号，发布或高风险改动时建议执行）
 ./tests/scripts/run-live.sh
 ```
 

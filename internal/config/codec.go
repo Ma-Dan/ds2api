@@ -17,17 +17,14 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	if len(c.Keys) > 0 {
 		m["keys"] = c.Keys
 	}
+	if len(c.APIKeys) > 0 {
+		m["api_keys"] = c.APIKeys
+	}
 	if len(c.Accounts) > 0 {
 		m["accounts"] = c.Accounts
 	}
 	if len(c.Proxies) > 0 {
 		m["proxies"] = c.Proxies
-	}
-	if len(c.ClaudeMapping) > 0 {
-		m["claude_mapping"] = c.ClaudeMapping
-	}
-	if len(c.ClaudeModelMap) > 0 {
-		m["claude_model_mapping"] = c.ClaudeModelMap
 	}
 	if len(c.ModelAliases) > 0 {
 		m["model_aliases"] = c.ModelAliases
@@ -38,9 +35,6 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	if c.Runtime.AccountMaxInflight > 0 || c.Runtime.AccountMaxQueue > 0 || c.Runtime.GlobalMaxInflight > 0 || c.Runtime.TokenRefreshIntervalHours > 0 {
 		m["runtime"] = c.Runtime
 	}
-	if c.Compat.WideInputStrictOutput != nil || c.Compat.StripReferenceMarkers != nil {
-		m["compat"] = c.Compat
-	}
 	if c.Responses.StoreTTLSeconds > 0 {
 		m["responses"] = c.Responses
 	}
@@ -48,6 +42,15 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		m["embeddings"] = c.Embeddings
 	}
 	m["auto_delete"] = c.AutoDelete
+	if c.CurrentInputFile.Enabled != nil || c.CurrentInputFile.MinChars != 0 {
+		m["current_input_file"] = c.CurrentInputFile
+	}
+	if c.ThinkingInjection.Enabled != nil || strings.TrimSpace(c.ThinkingInjection.Prompt) != "" {
+		m["thinking_injection"] = c.ThinkingInjection
+	}
+	if strings.TrimSpace(c.Vercel.Token) != "" || strings.TrimSpace(c.Vercel.ProjectID) != "" || strings.TrimSpace(c.Vercel.TeamID) != "" {
+		m["vercel"] = NormalizeVercelConfig(c.Vercel)
+	}
 	if c.VercelSyncHash != "" {
 		m["_vercel_sync_hash"] = c.VercelSyncHash
 	}
@@ -69,6 +72,10 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 			if err := json.Unmarshal(v, &c.Keys); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
 			}
+		case "api_keys":
+			if err := json.Unmarshal(v, &c.APIKeys); err != nil {
+				return fmt.Errorf("invalid field %q: %w", k, err)
+			}
 		case "accounts":
 			if err := json.Unmarshal(v, &c.Accounts); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
@@ -78,13 +85,8 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 				return fmt.Errorf("invalid field %q: %w", k, err)
 			}
 		case "claude_mapping":
-			if err := json.Unmarshal(v, &c.ClaudeMapping); err != nil {
-				return fmt.Errorf("invalid field %q: %w", k, err)
-			}
 		case "claude_model_mapping":
-			if err := json.Unmarshal(v, &c.ClaudeModelMap); err != nil {
-				return fmt.Errorf("invalid field %q: %w", k, err)
-			}
+			// Removed legacy mapping fields are ignored instead of persisted.
 		case "model_aliases":
 			if err := json.Unmarshal(v, &c.ModelAliases); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
@@ -98,8 +100,9 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 				return fmt.Errorf("invalid field %q: %w", k, err)
 			}
 		case "compat":
-			if err := json.Unmarshal(v, &c.Compat); err != nil {
-				return fmt.Errorf("invalid field %q: %w", k, err)
+			// Removed field ignored instead of persisted.
+			if Logger != nil {
+				Logger.Warn("config key \"compat\" is deprecated and ignored; remove it from your configuration")
 			}
 		case "toolcall":
 			// Legacy field ignored. Toolcall policy is fixed and no longer configurable.
@@ -113,6 +116,20 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 			}
 		case "auto_delete":
 			if err := json.Unmarshal(v, &c.AutoDelete); err != nil {
+				return fmt.Errorf("invalid field %q: %w", k, err)
+			}
+		case "history_split":
+			// Removed legacy split field is ignored instead of persisted.
+		case "current_input_file":
+			if err := json.Unmarshal(v, &c.CurrentInputFile); err != nil {
+				return fmt.Errorf("invalid field %q: %w", k, err)
+			}
+		case "thinking_injection":
+			if err := json.Unmarshal(v, &c.ThinkingInjection); err != nil {
+				return fmt.Errorf("invalid field %q: %w", k, err)
+			}
+		case "vercel":
+			if err := json.Unmarshal(v, &c.Vercel); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
 			}
 		case "_vercel_sync_hash":
@@ -130,26 +147,31 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 			}
 		}
 	}
+	c.NormalizeCredentials()
 	return nil
 }
 
 func (c Config) Clone() Config {
 	clone := Config{
-		Keys:           slices.Clone(c.Keys),
-		Accounts:       slices.Clone(c.Accounts),
-		Proxies:        slices.Clone(c.Proxies),
-		ClaudeMapping:  cloneStringMap(c.ClaudeMapping),
-		ClaudeModelMap: cloneStringMap(c.ClaudeModelMap),
-		ModelAliases:   cloneStringMap(c.ModelAliases),
-		Admin:          c.Admin,
-		Runtime:        c.Runtime,
-		Compat: CompatConfig{
-			WideInputStrictOutput: cloneBoolPtr(c.Compat.WideInputStrictOutput),
-			StripReferenceMarkers: cloneBoolPtr(c.Compat.StripReferenceMarkers),
+		Keys:         slices.Clone(c.Keys),
+		APIKeys:      slices.Clone(c.APIKeys),
+		Accounts:     slices.Clone(c.Accounts),
+		Proxies:      slices.Clone(c.Proxies),
+		ModelAliases: cloneStringMap(c.ModelAliases),
+		Admin:        c.Admin,
+		Runtime:      c.Runtime,
+		Responses:    c.Responses,
+		Embeddings:   c.Embeddings,
+		AutoDelete:   c.AutoDelete,
+		CurrentInputFile: CurrentInputFileConfig{
+			Enabled:  cloneBoolPtr(c.CurrentInputFile.Enabled),
+			MinChars: c.CurrentInputFile.MinChars,
 		},
-		Responses:        c.Responses,
-		Embeddings:       c.Embeddings,
-		AutoDelete:       c.AutoDelete,
+		ThinkingInjection: ThinkingInjectionConfig{
+			Enabled: cloneBoolPtr(c.ThinkingInjection.Enabled),
+			Prompt:  c.ThinkingInjection.Prompt,
+		},
+		Vercel:           c.Vercel,
 		VercelSyncHash:   c.VercelSyncHash,
 		VercelSyncTime:   c.VercelSyncTime,
 		AdditionalFields: map[string]any{},

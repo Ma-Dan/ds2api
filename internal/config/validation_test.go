@@ -39,6 +39,11 @@ func TestValidateConfigRejectsInvalidValues(t *testing.T) {
 			cfg:  Config{AutoDelete: AutoDeleteConfig{Mode: "maybe"}},
 			want: "auto_delete.mode",
 		},
+		{
+			name: "current input file",
+			cfg:  Config{CurrentInputFile: CurrentInputFileConfig{MinChars: -1}},
+			want: "current_input_file.min_chars",
+		},
 	}
 
 	for _, tc := range tests {

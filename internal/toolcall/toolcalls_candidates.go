@@ -1,205 +1,691 @@
 package toolcall
 
 import (
-	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
-var toolCallPattern = regexp.MustCompile(`\{\s*["']tool_calls["']\s*:\s*\[(.*?)\]\s*\}`)
-var fencedJSONPattern = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)\\s*```")
-var fencedCodeBlockPattern = regexp.MustCompile("(?s)```[\\s\\S]*?```")
-
-//nolint:unused // retained for future markup tool-call heuristics.
-var markupToolSyntaxPattern = regexp.MustCompile(`(?i)<(?:(?:[a-z0-9_:-]+:)?(?:tool_call|function_call|invoke)\b|(?:[a-z0-9_:-]+:)?function_calls\b|(?:[a-z0-9_:-]+:)?tool_use\b)`)
-
-func buildToolCallCandidates(text string) []string {
-	trimmed := strings.TrimSpace(text)
-	candidates := []string{trimmed}
-
-	// fenced code block candidates: ```json ... ```
-	for _, match := range fencedJSONPattern.FindAllStringSubmatch(trimmed, -1) {
-		if len(match) >= 2 {
-			candidates = append(candidates, strings.TrimSpace(match[1]))
-		}
-	}
-
-	// best-effort extraction around tool call keywords in mixed text payloads.
-	candidates = append(candidates, extractToolCallObjects(trimmed)...)
-
-	// best-effort object slice: from first '{' to last '}'
-	first := strings.Index(trimmed, "{")
-	last := strings.LastIndex(trimmed, "}")
-	if first >= 0 && last > first {
-		candidates = append(candidates, strings.TrimSpace(trimmed[first:last+1]))
-	}
-	// best-effort array slice: from first '[' to last ']'
-	firstArr := strings.Index(trimmed, "[")
-	lastArr := strings.LastIndex(trimmed, "]")
-	if firstArr >= 0 && lastArr > firstArr {
-		candidates = append(candidates, strings.TrimSpace(trimmed[firstArr:lastArr+1]))
-	}
-
-	// legacy regex extraction fallback
-	if m := toolCallPattern.FindStringSubmatch(trimmed); len(m) >= 2 {
-		candidates = append(candidates, "{"+`"tool_calls":[`+m[1]+"]}")
-	}
-
-	uniq := make([]string, 0, len(candidates))
-	seen := map[string]struct{}{}
-	for _, c := range candidates {
-		if c == "" {
-			continue
-		}
-		if _, ok := seen[c]; ok {
-			continue
-		}
-		seen[c] = struct{}{}
-		uniq = append(uniq, c)
-	}
-	return uniq
+type canonicalToolMarkupAttr struct {
+	Key   string
+	Value string
 }
 
-func extractToolCallObjects(text string) []string {
+func canonicalizeToolCallCandidateSpans(text string) string {
 	if text == "" {
-		return nil
+		return ""
 	}
-	lower := strings.ToLower(text)
-	out := []string{}
-	offset := 0
-	keywords := []string{"tool_calls", "\"function\"", "function.name:", "functioncall", "\"tool_use\""}
-	for {
-		bestIdx := -1
-		matchedKeyword := ""
-		for _, kw := range keywords {
-			idx := strings.Index(lower[offset:], kw)
-			if idx >= 0 {
-				absIdx := offset + idx
-				if bestIdx < 0 || absIdx < bestIdx {
-					bestIdx = absIdx
-					matchedKeyword = kw
-				}
-			}
-		}
-
-		if bestIdx < 0 {
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); {
+		next, advanced, blocked := skipXMLIgnoredSection(text, i)
+		if blocked {
+			b.WriteString(text[i:])
 			break
 		}
-
-		idx := bestIdx
-		// Avoid backtracking too far to prevent OOM on malicious or very long strings
-		searchLimit := idx - 2000
-		if searchLimit < offset {
-			searchLimit = offset
+		if advanced {
+			b.WriteString(text[i:next])
+			i = next
+			continue
 		}
-
-		start := strings.LastIndex(text[searchLimit:idx], "{")
-		if start >= 0 {
-			start += searchLimit
+		if end, ok := markdownCodeSpanEnd(text, i); ok {
+			b.WriteString(text[i:end])
+			i = end
+			continue
 		}
+		tag, ok := scanToolMarkupTagAt(text, i)
+		if !ok {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		b.WriteString(canonicalizeRecognizedToolMarkupTag(text[tag.Start:tag.End+1], tag))
+		i = tag.End + 1
+	}
+	return b.String()
+}
 
-		if start < 0 {
-			offset = idx + len(matchedKeyword)
+func canonicalizeRecognizedToolMarkupTag(raw string, tag ToolMarkupTag) string {
+	if raw == "" {
+		return raw
+	}
+	idx := 0
+	if delimLen := xmlTagStartDelimiterLenAt(raw, idx); delimLen > 0 {
+		idx += delimLen
+	}
+	for {
+		idx = skipToolMarkupIgnorables(raw, idx)
+		if delimLen := xmlTagStartDelimiterLenAt(raw, idx); delimLen > 0 {
+			idx += delimLen
+			continue
+		}
+		break
+	}
+	idx = skipToolMarkupIgnorables(raw, idx)
+	if tag.Closing {
+		if next, ok := consumeToolMarkupClosingSlash(raw, idx); ok {
+			idx = next
+		}
+	}
+	idx, _ = consumeToolMarkupNamePrefix(raw, idx)
+	afterName, ok := consumeToolKeyword(raw, idx, rawNameForTag(tag))
+	if !ok {
+		afterName = idx
+	}
+
+	attrs := parseCanonicalToolMarkupAttrs(raw, afterName)
+
+	var b strings.Builder
+	b.Grow(len(raw) + 8)
+	b.WriteByte('<')
+	if tag.Closing {
+		b.WriteByte('/')
+	}
+	if tag.DSMLLike {
+		b.WriteString("|DSML|")
+	}
+	b.WriteString(tag.Name)
+	for _, attr := range attrs {
+		if attr.Key == "" {
+			continue
+		}
+		b.WriteByte(' ')
+		b.WriteString(attr.Key)
+		b.WriteString(`="`)
+		b.WriteString(quoteCanonicalXMLAttrValue(attr.Value))
+		b.WriteByte('"')
+	}
+	if tag.SelfClosing {
+		b.WriteByte('/')
+	}
+	b.WriteByte('>')
+	return b.String()
+}
+
+func rawNameForTag(tag ToolMarkupTag) string {
+	for _, name := range toolMarkupNames {
+		if name.canonical == tag.Name {
+			return name.raw
+		}
+	}
+	return tag.Name
+}
+
+func parseCanonicalToolMarkupAttrs(raw string, idx int) []canonicalToolMarkupAttr {
+	if raw == "" || idx >= len(raw) {
+		return nil
+	}
+	var out []canonicalToolMarkupAttr
+	for idx < len(raw) {
+		idx = skipToolMarkupIgnorables(raw, idx)
+		if idx >= len(raw) {
+			break
+		}
+		if spacingLen := toolMarkupWhitespaceLikeLenAt(raw, idx); spacingLen > 0 {
+			idx += spacingLen
+			continue
+		}
+		if xmlTagEndDelimiterLenAt(raw, idx) > 0 {
+			break
+		}
+		if next, ok := consumeToolMarkupPipe(raw, idx); ok {
+			idx = next
+			continue
+		}
+		if next, ok := consumeToolMarkupClosingSlash(raw, idx); ok {
+			idx = next
 			continue
 		}
 
-		foundObj := false
-		for start >= searchLimit {
-			candidate, end, ok := extractJSONObject(text, start)
-			if ok {
-				// Move forward to avoid repeatedly matching the same object.
-				offset = end
-				out = append(out, strings.TrimSpace(candidate))
-				foundObj = true
+		keyStart := idx
+		for idx < len(raw) {
+			idx = skipToolMarkupIgnorables(raw, idx)
+			if idx >= len(raw) {
 				break
 			}
-			// Try previous '{'
-			if start > searchLimit {
-				prevStart := strings.LastIndex(text[searchLimit:start], "{")
-				if prevStart >= 0 {
-					start = searchLimit + prevStart
-					continue
-				}
+			if spacingLen := toolMarkupWhitespaceLikeLenAt(raw, idx); spacingLen > 0 {
+				break
 			}
-			break
+			if toolMarkupEqualsLenAt(raw, idx) > 0 || xmlTagEndDelimiterLenAt(raw, idx) > 0 {
+				break
+			}
+			if _, ok := consumeToolMarkupPipe(raw, idx); ok {
+				break
+			}
+			if _, ok := consumeToolMarkupClosingSlash(raw, idx); ok {
+				break
+			}
+			_, size := utf8.DecodeRuneInString(raw[idx:])
+			if size <= 0 {
+				idx++
+			} else {
+				idx += size
+			}
+		}
+		keyEnd := idx
+		key := normalizeCanonicalToolAttrKey(raw[keyStart:keyEnd])
+		idx = skipToolMarkupIgnorables(raw, idx)
+		for {
+			spacingLen := toolMarkupWhitespaceLikeLenAt(raw, idx)
+			if spacingLen == 0 {
+				break
+			}
+			idx += spacingLen
+			idx = skipToolMarkupIgnorables(raw, idx)
+		}
+		if eqLen := toolMarkupEqualsLenAt(raw, idx); eqLen > 0 {
+			idx += eqLen
+		} else {
+			continue
+		}
+		idx = skipToolMarkupIgnorables(raw, idx)
+		for {
+			spacingLen := toolMarkupWhitespaceLikeLenAt(raw, idx)
+			if spacingLen == 0 {
+				break
+			}
+			idx += spacingLen
+			idx = skipToolMarkupIgnorables(raw, idx)
+		}
+		if key == "" {
+			_, size := utf8.DecodeRuneInString(raw[idx:])
+			if size <= 0 {
+				idx++
+			} else {
+				idx += size
+			}
+			continue
 		}
 
-		if !foundObj {
-			offset = idx + len(matchedKeyword)
+		value := ""
+		if quote, quoteLen := xmlQuotePairAt(raw, idx); quoteLen > 0 {
+			valueStart := idx + quoteLen
+			idx = valueStart
+			for idx < len(raw) {
+				if closeLen := xmlQuoteCloseDelimiterLenAt(raw, idx, quote); closeLen > 0 {
+					value = raw[valueStart:idx]
+					idx += closeLen
+					break
+				}
+				_, size := utf8.DecodeRuneInString(raw[idx:])
+				if size <= 0 {
+					idx++
+				} else {
+					idx += size
+				}
+			}
+		} else {
+			valueStart := idx
+			for idx < len(raw) {
+				if spacingLen := toolMarkupWhitespaceLikeLenAt(raw, idx); spacingLen > 0 {
+					break
+				}
+				if xmlTagEndDelimiterLenAt(raw, idx) > 0 || toolMarkupEqualsLenAt(raw, idx) > 0 {
+					break
+				}
+				if _, ok := consumeToolMarkupPipe(raw, idx); ok {
+					break
+				}
+				if _, ok := consumeToolMarkupClosingSlash(raw, idx); ok {
+					break
+				}
+				_, size := utf8.DecodeRuneInString(raw[idx:])
+				if size <= 0 {
+					idx++
+				} else {
+					idx += size
+				}
+			}
+			value = raw[valueStart:idx]
 		}
+
+		out = append(out, canonicalToolMarkupAttr{
+			Key:   key,
+			Value: value,
+		})
 	}
 	return out
 }
 
-func extractJSONObject(text string, start int) (string, int, bool) {
-	if start < 0 || start >= len(text) || text[start] != '{' {
-		return "", 0, false
-	}
-	depth := 0
-	quote := byte(0)
-	escaped := false
-	// Limit scan length to avoid OOM on unclosed objects
-	maxLen := start + 50000
-	if maxLen > len(text) {
-		maxLen = len(text)
-	}
-	for i := start; i < maxLen; i++ {
-		ch := text[i]
-		if quote != 0 {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if ch == '\\' {
-				escaped = true
-				continue
-			}
-			if ch == quote {
-				quote = 0
-			}
-			continue
-		}
-		if ch == '"' || ch == '\'' {
-			quote = ch
-			continue
-		}
-		if ch == '{' {
-			depth++
-			continue
-		}
-		if ch == '}' {
-			depth--
-			if depth == 0 {
-				return text[start : i+1], i + 1, true
-			}
-		}
-	}
-	return "", 0, false
-}
-
-func looksLikeToolExampleContext(text string) bool {
-	t := strings.ToLower(strings.TrimSpace(text))
-	if t == "" {
-		return false
-	}
-	return strings.Contains(t, "```")
-}
-
-func shouldSkipToolCallParsingForCodeFenceExample(text string) bool {
-	if !looksLikeToolCallSyntax(text) {
-		return false
-	}
-	stripped := strings.TrimSpace(stripFencedCodeBlocks(text))
-	return !looksLikeToolCallSyntax(stripped)
-}
-
-//nolint:unused // retained for future markup tool-call heuristics.
-func looksLikeMarkupToolSyntax(text string) bool {
-	return markupToolSyntaxPattern.MatchString(text)
-}
-
-func stripFencedCodeBlocks(text string) string {
-	if text == "" {
+func normalizeCanonicalToolAttrKey(raw string) string {
+	trimmed := strings.TrimSpace(removeToolMarkupIgnorables(raw))
+	if trimmed == "" {
 		return ""
 	}
-	return fencedCodeBlockPattern.ReplaceAllString(text, " ")
+	if next, ok := consumeToolKeyword(trimmed, 0, "name"); ok {
+		if skipToolMarkupIgnorables(trimmed, next) == len(trimmed) {
+			return "name"
+		}
+	}
+	return ""
+}
+
+func quoteCanonicalXMLAttrValue(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	return strings.ReplaceAll(raw, `"`, "&quot;")
+}
+
+func removeToolMarkupIgnorables(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); {
+		if ignorableLen := toolMarkupIgnorableLenAt(raw, i); ignorableLen > 0 {
+			i += ignorableLen
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(raw[i:])
+		if size <= 0 {
+			b.WriteByte(raw[i])
+			i++
+			continue
+		}
+		b.WriteRune(r)
+		i += size
+	}
+	return b.String()
+}
+
+func skipToolMarkupIgnorables(text string, idx int) int {
+	for idx < len(text) {
+		if ignorableLen := toolMarkupIgnorableLenAt(text, idx); ignorableLen > 0 {
+			idx += ignorableLen
+			continue
+		}
+		break
+	}
+	return idx
+}
+
+func toolMarkupIgnorableLenAt(text string, idx int) int {
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	r, size := utf8.DecodeRuneInString(text[idx:])
+	if size <= 0 {
+		return 0
+	}
+	if unicode.Is(unicode.Cf, r) {
+		return size
+	}
+	if unicode.IsControl(r) && !unicode.IsSpace(r) {
+		return size
+	}
+	return 0
+}
+
+func toolMarkupEqualsLenAt(text string, idx int) int {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	switch {
+	case text[idx] == '=':
+		return 1
+	case strings.HasPrefix(text[idx:], "＝"):
+		return len("＝")
+	case strings.HasPrefix(text[idx:], "﹦"):
+		return len("﹦")
+	case strings.HasPrefix(text[idx:], "꞊"):
+		return len("꞊")
+	default:
+		return 0
+	}
+}
+
+func toolMarkupDashLenAt(text string, idx int) int {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	switch {
+	case text[idx] == '-':
+		return 1
+	case strings.HasPrefix(text[idx:], "‐"):
+		return len("‐")
+	case strings.HasPrefix(text[idx:], "‑"):
+		return len("‑")
+	case strings.HasPrefix(text[idx:], "‒"):
+		return len("‒")
+	case strings.HasPrefix(text[idx:], "–"):
+		return len("–")
+	case strings.HasPrefix(text[idx:], "—"):
+		return len("—")
+	case strings.HasPrefix(text[idx:], "―"):
+		return len("―")
+	case strings.HasPrefix(text[idx:], "−"):
+		return len("−")
+	case strings.HasPrefix(text[idx:], "﹣"):
+		return len("﹣")
+	case strings.HasPrefix(text[idx:], "－"):
+		return len("－")
+	default:
+		return 0
+	}
+}
+
+func toolMarkupUnderscoreLenAt(text string, idx int) int {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	switch {
+	case text[idx] == '_':
+		return 1
+	case strings.HasPrefix(text[idx:], "＿"):
+		return len("＿")
+	case strings.HasPrefix(text[idx:], "﹍"):
+		return len("﹍")
+	case strings.HasPrefix(text[idx:], "﹎"):
+		return len("﹎")
+	case strings.HasPrefix(text[idx:], "﹏"):
+		return len("﹏")
+	default:
+		return 0
+	}
+}
+
+func consumeToolKeyword(text string, idx int, keyword string) (int, bool) {
+	next := idx
+	for i := 0; i < len(keyword); i++ {
+		next = skipToolMarkupIgnorables(text, next)
+		if next >= len(text) {
+			return idx, false
+		}
+		target := asciiLower(keyword[i])
+		switch target {
+		case '_':
+			if underscoreLen := toolMarkupUnderscoreLenAt(text, next); underscoreLen > 0 {
+				next += underscoreLen
+				continue
+			}
+			return idx, false
+		case '-':
+			if dashLen := toolMarkupDashLenAt(text, next); dashLen > 0 {
+				next += dashLen
+				continue
+			}
+			return idx, false
+		default:
+			r, size := utf8.DecodeRuneInString(text[next:])
+			if size <= 0 {
+				return idx, false
+			}
+			folded, ok := foldToolKeywordRune(r)
+			if !ok || folded != target {
+				return idx, false
+			}
+			next += size
+		}
+	}
+	return next, true
+}
+
+func foldToolKeywordRune(r rune) (byte, bool) {
+	if r >= 'Ａ' && r <= 'Ｚ' {
+		r = r - 'Ａ' + 'A'
+	}
+	if r >= 'ａ' && r <= 'ｚ' {
+		r = r - 'ａ' + 'a'
+	}
+	r = unicode.ToLower(r)
+	switch r {
+	case 'a', 'c', 'd', 'e', 'i', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't', 'v':
+		return byte(r), true
+	case 'а', 'Α', 'α':
+		return 'a', true
+	case 'с', 'С', 'ϲ', 'Ϲ':
+		return 'c', true
+	case 'ԁ', 'ⅾ':
+		return 'd', true
+	case 'е', 'Е', 'Ε', 'ε':
+		return 'e', true
+	case 'і', 'І', 'Ι', 'ι', 'ı':
+		return 'i', true
+	case 'к', 'К', 'Κ', 'κ':
+		return 'k', true
+	case 'ⅼ':
+		return 'l', true
+	case 'м', 'М', 'Μ', 'μ':
+		return 'm', true
+	case 'ո':
+		return 'n', true
+	case 'о', 'О', 'Ο', 'ο':
+		return 'o', true
+	case 'р', 'Р', 'Ρ', 'ρ':
+		return 'p', true
+	case 'ѕ', 'Ѕ':
+		return 's', true
+	case 'т', 'Т', 'Τ', 'τ':
+		return 't', true
+	case 'ν', 'Ν', 'ѵ', 'ⅴ':
+		return 'v', true
+	default:
+		return 0, false
+	}
+}
+
+func toolMarkupWhitespaceLikeLenAt(text string, idx int) int {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	switch text[idx] {
+	case ' ', '\t', '\n', '\r':
+		return 1
+	}
+	if strings.HasPrefix(text[idx:], "▁") {
+		return len("▁")
+	}
+	r, size := utf8.DecodeRuneInString(text[idx:])
+	if size > 0 && unicode.IsSpace(r) {
+		return size
+	}
+	return 0
+}
+
+func consumeToolMarkupPipe(text string, idx int) (int, bool) {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx >= len(text) {
+		return idx, false
+	}
+	switch {
+	case text[idx] == '|':
+		return idx + 1, true
+	case strings.HasPrefix(text[idx:], "│"):
+		return idx + len("│"), true
+	case strings.HasPrefix(text[idx:], "∣"):
+		return idx + len("∣"), true
+	case strings.HasPrefix(text[idx:], "❘"):
+		return idx + len("❘"), true
+	case strings.HasPrefix(text[idx:], "ǀ"):
+		return idx + len("ǀ"), true
+	case strings.HasPrefix(text[idx:], "￨"):
+		return idx + len("￨"), true
+	default:
+		return idx, false
+	}
+}
+
+func consumeToolMarkupClosingSlash(text string, idx int) (int, bool) {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx >= len(text) {
+		return idx, false
+	}
+	switch {
+	case text[idx] == '/':
+		return idx + 1, true
+	case strings.HasPrefix(text[idx:], "／"):
+		return idx + len("／"), true
+	case strings.HasPrefix(text[idx:], "∕"):
+		return idx + len("∕"), true
+	case strings.HasPrefix(text[idx:], "⁄"):
+		return idx + len("⁄"), true
+	case strings.HasPrefix(text[idx:], "⧸"):
+		return idx + len("⧸"), true
+	default:
+		return idx, false
+	}
+}
+
+func xmlTagStartDelimiterLenAt(text string, idx int) int {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	switch {
+	case text[idx] == '<':
+		return 1
+	case strings.HasPrefix(text[idx:], "＜"):
+		return len("＜")
+	case strings.HasPrefix(text[idx:], "﹤"):
+		return len("﹤")
+	case strings.HasPrefix(text[idx:], "〈"):
+		return len("〈")
+	default:
+		return 0
+	}
+}
+
+func xmlTagEndDelimiterLenAt(text string, idx int) int {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return 0
+	}
+	switch {
+	case text[idx] == '>':
+		return 1
+	case strings.HasPrefix(text[idx:], "＞"):
+		return len("＞")
+	case strings.HasPrefix(text[idx:], "﹥"):
+		return len("﹥")
+	case strings.HasPrefix(text[idx:], "〉"):
+		return len("〉")
+	default:
+		return 0
+	}
+}
+
+func xmlTagEndDelimiterLenEndingAt(text string, end int) int {
+	if end < 0 || end >= len(text) {
+		return 0
+	}
+	if text[end] == '>' {
+		return 1
+	}
+	if end+1 >= len("＞") && text[end+1-len("＞"):end+1] == "＞" {
+		return len("＞")
+	}
+	return 0
+}
+
+func xmlQuotePairAt(text string, idx int) (string, int) {
+	idx = skipToolMarkupIgnorables(text, idx)
+	if idx < 0 || idx >= len(text) {
+		return "", 0
+	}
+	switch {
+	case text[idx] == '"':
+		return `"`, 1
+	case text[idx] == '\'':
+		return `'`, 1
+	case strings.HasPrefix(text[idx:], "“"):
+		return "”", len("“")
+	case strings.HasPrefix(text[idx:], "‘"):
+		return "’", len("‘")
+	case strings.HasPrefix(text[idx:], "＂"):
+		return "＂", len("＂")
+	case strings.HasPrefix(text[idx:], "＇"):
+		return "＇", len("＇")
+	case strings.HasPrefix(text[idx:], "„"):
+		return "”", len("„")
+	case strings.HasPrefix(text[idx:], "‟"):
+		return "”", len("‟")
+	default:
+		return "", 0
+	}
+}
+
+func xmlQuoteCloseDelimiterLenAt(text string, idx int, quote string) int {
+	if quote == "" || idx < 0 || idx >= len(text) {
+		return 0
+	}
+	if strings.HasPrefix(text[idx:], quote) {
+		return len(quote)
+	}
+	return 0
+}
+
+func hasRepairableXMLToolCallsWrapper(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if _, ok := firstToolMarkupTagByName(text, "tool_calls", false); ok {
+		return false
+	}
+	invokeTag, ok := firstToolMarkupTagByName(text, "invoke", false)
+	if !ok {
+		return false
+	}
+	closeTag, ok := lastToolMarkupTagByName(text, "tool_calls", true)
+	if !ok {
+		return false
+	}
+	return invokeTag.Start < closeTag.Start
+}
+
+func toolCDATAOpenLenAt(text string, idx int) int {
+	start := skipToolMarkupIgnorables(text, idx)
+	ltLen := xmlTagStartDelimiterLenAt(text, start)
+	if ltLen == 0 {
+		return 0
+	}
+	pos := start + ltLen
+	for skipped := 0; skipped <= 4 && pos < len(text); skipped++ {
+		pos = skipToolMarkupIgnorables(text, pos)
+		if pos >= len(text) {
+			return 0
+		}
+		if text[pos] == '[' {
+			pos++
+			next, ok := consumeToolKeyword(text, pos, "cdata")
+			if !ok {
+				return 0
+			}
+			pos = skipToolMarkupIgnorables(text, next)
+			if pos >= len(text) || text[pos] != '[' {
+				return 0
+			}
+			pos++
+			return pos - idx
+		}
+		r, size := utf8.DecodeRuneInString(text[pos:])
+		if size <= 0 || !isToolMarkupSeparator(r) {
+			return 0
+		}
+		pos += size
+	}
+	return 0
+}
+
+func indexToolCDATAOpen(text string, start int) int {
+	for i := maxInt(start, 0); i < len(text); i++ {
+		if toolCDATAOpenLenAt(text, i) > 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func findTrailingToolCDATACloseStart(text string) int {
+	for i := len(text) - 1; i >= 0; i-- {
+		if closeLen := toolCDATACloseLenAt(text, i); closeLen > 0 && i+closeLen == len(text) {
+			return i
+		}
+	}
+	return -1
 }

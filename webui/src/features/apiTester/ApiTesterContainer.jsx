@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState } from 'react'
 import clsx from 'clsx'
 
 import { useI18n } from '../../i18n'
@@ -6,14 +7,81 @@ import { useChatStreamClient } from './useChatStreamClient'
 import ConfigPanel from './ConfigPanel'
 import ChatPanel from './ChatPanel'
 
+function describeModel(t, modelID) {
+    const noThinking = modelID.endsWith('-nothinking')
+
+    let description = t('apiTester.models.generic')
+    if (modelID.includes('vision')) {
+        description = t('apiTester.models.vision')
+    } else if (modelID.includes('pro-search')) {
+        description = t('apiTester.models.proSearch')
+    } else if (modelID.includes('pro')) {
+        description = t('apiTester.models.pro')
+    } else if (modelID.includes('flash-search')) {
+        description = t('apiTester.models.flashSearch')
+    } else if (modelID.includes('flash')) {
+        description = t('apiTester.models.flash')
+    }
+
+    if (noThinking) {
+        return `${description} · ${t('apiTester.models.noThinking')}`
+    }
+    return description
+}
+
+function decorateModel(t, modelID) {
+    const isVision = modelID.includes('vision')
+    const isSearch = modelID.includes('search')
+    const isPro = modelID.includes('pro')
+
+    if (isVision && isSearch) {
+        return {
+            id: modelID,
+            name: modelID,
+            icon: 'ImageIcon',
+            desc: describeModel(t, modelID),
+            color: 'text-fuchsia-600',
+        }
+    }
+    if (isVision) {
+        return {
+            id: modelID,
+            name: modelID,
+            icon: 'ImageIcon',
+            desc: describeModel(t, modelID),
+            color: 'text-violet-500',
+        }
+    }
+    if (isSearch) {
+        return {
+            id: modelID,
+            name: modelID,
+            icon: 'SearchIcon',
+            desc: describeModel(t, modelID),
+            color: isPro ? 'text-cyan-600' : 'text-cyan-500',
+        }
+    }
+    return {
+        id: modelID,
+        name: modelID,
+        icon: isPro ? 'Cpu' : 'MessageSquare',
+        desc: describeModel(t, modelID),
+        color: isPro ? 'text-amber-600' : 'text-amber-500',
+    }
+}
+
 export default function ApiTesterContainer({ config, onMessage, authFetch }) {
     const { t } = useI18n()
+    const [availableModelIDs, setAvailableModelIDs] = useState([])
+    const [modelsLoaded, setModelsLoaded] = useState(false)
 
     const {
         model,
         setModel,
         message,
         setMessage,
+        attachedFiles,
+        setAttachedFiles,
         apiKey,
         setApiKey,
         selectedAccount,
@@ -47,20 +115,58 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
     const customKeyActive = trimmedApiKey !== ''
     const customKeyManaged = customKeyActive && configuredKeys.includes(trimmedApiKey)
 
-    const models = [
-        { id: 'deepseek-chat', name: 'deepseek-chat', icon: 'MessageSquare', desc: t('apiTester.models.chat'), color: 'text-amber-500' },
-        { id: 'deepseek-reasoner', name: 'deepseek-reasoner', icon: 'Cpu', desc: t('apiTester.models.reasoner'), color: 'text-amber-600' },
-        { id: 'deepseek-chat-search', name: 'deepseek-chat-search', icon: 'SearchIcon', desc: t('apiTester.models.chatSearch'), color: 'text-cyan-500' },
-        { id: 'deepseek-reasoner-search', name: 'deepseek-reasoner-search', icon: 'SearchIcon', desc: t('apiTester.models.reasonerSearch'), color: 'text-cyan-600' },
-        { id: 'deepseek-expert-chat', name: 'deepseek-expert-chat', icon: 'MessageSquare', desc: t('apiTester.models.expertChat'), color: 'text-emerald-500' },
-        { id: 'deepseek-expert-reasoner', name: 'deepseek-expert-reasoner', icon: 'Cpu', desc: t('apiTester.models.expertReasoner'), color: 'text-emerald-600' },
-        { id: 'deepseek-expert-chat-search', name: 'deepseek-expert-chat-search', icon: 'SearchIcon', desc: t('apiTester.models.expertChatSearch'), color: 'text-teal-500' },
-        { id: 'deepseek-expert-reasoner-search', name: 'deepseek-expert-reasoner-search', icon: 'SearchIcon', desc: t('apiTester.models.expertReasonerSearch'), color: 'text-teal-600' },
-        { id: 'deepseek-vision-chat', name: 'deepseek-vision-chat', icon: 'MessageSquare', desc: t('apiTester.models.visionChat'), color: 'text-violet-500' },
-        { id: 'deepseek-vision-reasoner', name: 'deepseek-vision-reasoner', icon: 'Cpu', desc: t('apiTester.models.visionReasoner'), color: 'text-violet-600' },
-        { id: 'deepseek-vision-chat-search', name: 'deepseek-vision-chat-search', icon: 'SearchIcon', desc: t('apiTester.models.visionChatSearch'), color: 'text-fuchsia-500' },
-        { id: 'deepseek-vision-reasoner-search', name: 'deepseek-vision-reasoner-search', icon: 'SearchIcon', desc: t('apiTester.models.visionReasonerSearch'), color: 'text-fuchsia-600' },
-    ]
+    useEffect(() => {
+        let disposed = false
+
+        async function loadModels() {
+            try {
+                const res = await authFetch('/v1/models')
+                if (!res.ok) {
+                    throw new Error(`failed to fetch models: ${res.status}`)
+                }
+                const data = await res.json()
+                const modelIDs = Array.isArray(data?.data)
+                    ? data.data
+                        .map((item) => String(item?.id || '').trim())
+                        .filter(Boolean)
+                    : []
+                if (!disposed) {
+                    setAvailableModelIDs(modelIDs)
+                }
+            } catch (_err) {
+                if (!disposed) {
+                    setAvailableModelIDs([])
+                }
+            } finally {
+                if (!disposed) {
+                    setModelsLoaded(true)
+                }
+            }
+        }
+
+        setModelsLoaded(false)
+        loadModels()
+        return () => {
+            disposed = true
+        }
+    }, [authFetch])
+
+    const models = useMemo(
+        () => availableModelIDs.map((modelID) => decorateModel(t, modelID)),
+        [availableModelIDs, t]
+    )
+
+    useEffect(() => {
+        if (!models.length) {
+            if (model) {
+                setModel('')
+            }
+            return
+        }
+        if (!model || !models.some((item) => item.id === model)) {
+            setModel(models[0].id)
+        }
+    }, [model, models, setModel])
 
     const { runTest, stopGeneration } = useChatStreamClient({
         t,
@@ -70,6 +176,7 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
         effectiveKey,
         selectedAccount,
         streamingMode,
+        attachedFiles,
         abortControllerRef,
         setLoading,
         setIsStreaming,
@@ -79,7 +186,7 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
     })
 
     return (
-        <div className={clsx('flex flex-col lg:grid lg:grid-cols-12 gap-6 h-[calc(100vh-140px)]')}>
+        <div className={clsx('flex flex-col lg:grid lg:grid-cols-12 gap-6 h-[calc(100vh-140px)] min-h-0')}>
             <ConfigPanel
                 t={t}
                 configExpanded={configExpanded}
@@ -87,6 +194,7 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
                 models={models}
                 model={model}
                 setModel={setModel}
+                modelsLoaded={modelsLoaded}
                 streamingMode={streamingMode}
                 setStreamingMode={setStreamingMode}
                 selectedAccount={selectedAccount}
@@ -104,6 +212,13 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
                 t={t}
                 message={message}
                 setMessage={setMessage}
+                attachedFiles={attachedFiles}
+                setAttachedFiles={setAttachedFiles}
+                setSelectedAccount={setSelectedAccount}
+                effectiveKey={effectiveKey}
+                selectedAccount={selectedAccount}
+                model={model}
+                onMessage={onMessage}
                 response={response}
                 isStreaming={isStreaming}
                 loading={loading}
@@ -111,6 +226,7 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
                 streamingContent={streamingContent}
                 onRunTest={runTest}
                 onStopGeneration={stopGeneration}
+                hasAvailableModel={models.length > 0}
             />
         </div>
     )

@@ -18,6 +18,7 @@ const {
   normalizePreparedToolNames,
   boolDefaultTrue,
   filterIncrementalToolCallDeltasByAllowed,
+  resetStreamToolCallState,
 } = require('./toolcall_policy');
 const {
   estimateTokens,
@@ -39,7 +40,7 @@ const {
 } = require('./dedupe');
 
 async function handler(req, res) {
-  setCorsHeaders(res);
+  setCorsHeaders(res, req);
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     res.end();
@@ -87,7 +88,7 @@ function isVercelRuntime() {
 
 function isNodeStreamSupportedPath(rawURL) {
   const path = extractPathname(rawURL);
-  return path === '/v1/chat/completions';
+  return path === '/v1/chat/completions' || path === '/chat/completions';
 }
 
 function extractPathname(rawURL) {
@@ -115,6 +116,7 @@ module.exports.__test = {
   normalizePreparedToolNames,
   boolDefaultTrue,
   filterIncrementalToolCallDeltasByAllowed,
+  resetStreamToolCallState,
   estimateTokens,
   buildUsage,
   filterLeakedContentFilterParts,

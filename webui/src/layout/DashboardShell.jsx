@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
     LayoutDashboard,
@@ -10,18 +10,33 @@ import {
     X,
     Server,
     Users,
-    Globe
+    Globe,
+    History,
+    Loader2
 } from 'lucide-react'
 import clsx from 'clsx'
 
-import AccountManagerContainer from '../features/account/AccountManagerContainer'
-import ApiTesterContainer from '../features/apiTester/ApiTesterContainer'
-import BatchImport from '../components/BatchImport'
-import VercelSyncContainer from '../features/vercel/VercelSyncContainer'
-import SettingsContainer from '../features/settings/SettingsContainer'
-import ProxyManagerContainer from '../features/proxy/ProxyManagerContainer'
 import LanguageToggle from '../components/LanguageToggle'
 import { useI18n } from '../i18n'
+
+const AccountManagerContainer = lazy(() => import('../features/account/AccountManagerContainer'))
+const ApiTesterContainer = lazy(() => import('../features/apiTester/ApiTesterContainer'))
+const ChatHistoryContainer = lazy(() => import('../features/chatHistory/ChatHistoryContainer'))
+const BatchImport = lazy(() => import('../components/BatchImport'))
+const VercelSyncContainer = lazy(() => import('../features/vercel/VercelSyncContainer'))
+const SettingsContainer = lazy(() => import('../features/settings/SettingsContainer'))
+const ProxyManagerContainer = lazy(() => import('../features/proxy/ProxyManagerContainer'))
+
+function TabLoadingFallback({ label }) {
+    return (
+        <div className="min-h-[320px] rounded-lg border border-border bg-card flex items-center justify-center">
+            <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>{label}</span>
+            </div>
+        </div>
+    )
+}
 
 export default function DashboardShell({ token, onLogout, config, fetchConfig, showMessage, message, onForceLogout, isVercel }) {
     const { t } = useI18n()
@@ -33,6 +48,7 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
         { id: 'accounts', label: t('nav.accounts.label'), icon: Users, description: t('nav.accounts.desc') },
         { id: 'proxies', label: t('nav.proxies.label'), icon: Globe, description: t('nav.proxies.desc') },
         { id: 'test', label: t('nav.test.label'), icon: Server, description: t('nav.test.desc') },
+        { id: 'history', label: t('nav.history.label'), icon: History, description: t('nav.history.desc') },
         { id: 'import', label: t('nav.import.label'), icon: Upload, description: t('nav.import.desc') },
         { id: 'vercel', label: t('nav.vercel.label'), icon: Cloud, description: t('nav.vercel.desc') },
         { id: 'settings', label: t('nav.settings.label'), icon: SettingsIcon, description: t('nav.settings.desc') },
@@ -44,6 +60,7 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
     const pathTab = routeSegments[0] || ''
     const activeTab = tabIds.has(pathTab) ? pathTab : 'accounts'
     const adminBasePath = pathSegments[0] === 'admin' ? '/admin' : ''
+    const activeNavItem = navItems.find(n => n.id === activeTab)
 
     const navigateToTab = useCallback((tabID) => {
         const nextPath = tabID === 'accounts'
@@ -98,6 +115,8 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
                 return <ProxyManagerContainer config={config} onRefresh={fetchConfig} onMessage={showMessage} authFetch={authFetch} />
             case 'test':
                 return <ApiTesterContainer config={config} onMessage={showMessage} authFetch={authFetch} />
+            case 'history':
+                return <ChatHistoryContainer onMessage={showMessage} authFetch={authFetch} />
             case 'import':
                 return <BatchImport onRefresh={fetchConfig} onMessage={showMessage} authFetch={authFetch} />
             case 'vercel':
@@ -227,10 +246,10 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
                     <div className="max-w-6xl mx-auto space-y-4 lg:space-y-6">
                         <div className="hidden lg:block mb-8">
                             <h1 className="text-3xl font-bold tracking-tight mb-2">
-                                {navItems.find(n => n.id === activeTab)?.label}
+                                {activeNavItem?.label}
                             </h1>
                             <p className="text-muted-foreground">
-                                {navItems.find(n => n.id === activeTab)?.description}
+                                {activeNavItem?.description}
                             </p>
                         </div>
 
@@ -246,7 +265,9 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
                         )}
 
                         <div className="animate-in fade-in duration-500">
-                            {renderTab()}
+                            <Suspense fallback={<TabLoadingFallback label={activeNavItem?.label || 'DS2API'} />}>
+                                {renderTab()}
+                            </Suspense>
                         </div>
                     </div>
                 </div>
